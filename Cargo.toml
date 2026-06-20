@@ -1,0 +1,20 @@
+[package]
+name = "rustplan"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rustplan"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1"
+indexmap = { version = "2", features = ["serde"] }
+
+[dependencies.tempfile]
+version = "3"
+
+[dev-dependencies]
