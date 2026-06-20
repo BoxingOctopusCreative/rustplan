@@ -1,41 +1,96 @@
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use indexmap::IndexMap;
 
 use super::{Backend, OutputFile};
 use crate::config::types::*;
 
 pub struct Networkd;
 
+#[derive(Default, Clone)]
+struct Membership {
+    bridge: Option<String>,
+    bond: Option<String>,
+    vrf: Option<String>,
+    vlans: Vec<String>,
+}
+
 impl Backend for Networkd {
     fn generate(&self, cfg: &NetworkConfig, root: &Path) -> Result<Vec<OutputFile>> {
         let out_dir = root.join("run/systemd/network");
+
+        // Pre-collect membership so each member gets the right [Network] entries
+        let mut memberships: IndexMap<String, Membership> = IndexMap::new();
+        for (id, dev) in &cfg.bridges {
+            for member in &dev.interfaces {
+                memberships.entry(member.clone()).or_default().bridge = Some(id.clone());
+            }
+        }
+        for (id, dev) in &cfg.bonds {
+            for member in &dev.interfaces {
+                memberships.entry(member.clone()).or_default().bond = Some(id.clone());
+            }
+        }
+        for (id, dev) in &cfg.vlans {
+            if let Some(parent) = &dev.link {
+                memberships.entry(parent.clone()).or_default().vlans.push(id.clone());
+            }
+        }
+        for (id, dev) in &cfg.vrfs {
+            for member in &dev.interfaces {
+                memberships.entry(member.clone()).or_default().vrf = Some(id.clone());
+            }
+        }
+
+        let no_membership = Membership::default();
+        let membership_for = |id: &str| memberships.get(id).unwrap_or(&no_membership);
+
         let mut files = Vec::new();
 
         for (id, dev) in &cfg.ethernets {
-            files.extend(ethernet_files(&out_dir, id, dev));
+            files.extend(ethernet_files(&out_dir, id, dev, membership_for(id)));
         }
         for (id, dev) in &cfg.wifis {
-            files.extend(wifi_files(&out_dir, id, dev));
+            files.extend(wifi_files(&out_dir, id, dev, membership_for(id)));
         }
         for (id, dev) in &cfg.bridges {
-            files.extend(bridge_files(&out_dir, id, dev));
+            files.extend(bridge_files(&out_dir, id, dev, membership_for(id)));
         }
         for (id, dev) in &cfg.bonds {
-            files.extend(bond_files(&out_dir, id, dev));
+            files.extend(bond_files(&out_dir, id, dev, membership_for(id)));
         }
         for (id, dev) in &cfg.vlans {
-            files.extend(vlan_files(&out_dir, id, dev));
+            files.extend(vlan_files(&out_dir, id, dev, membership_for(id)));
         }
         for (id, dev) in &cfg.tunnels {
-            files.extend(tunnel_files(&out_dir, id, dev));
+            files.extend(tunnel_files(&out_dir, id, dev, membership_for(id)));
         }
         for (id, dev) in &cfg.vrfs {
-            files.extend(vrf_files(&out_dir, id, dev));
+            files.extend(vrf_files(&out_dir, id, dev, membership_for(id)));
         }
         for (id, dev) in &cfg.dummy_devices {
-            files.extend(dummy_files(&out_dir, id, dev));
+            files.extend(dummy_files(&out_dir, id, dev, membership_for(id)));
+        }
+
+        // Stub .network files for members not explicitly declared as any device type
+        let declared: HashSet<&str> = cfg.ethernets.keys()
+            .chain(cfg.wifis.keys())
+            .chain(cfg.bridges.keys())
+            .chain(cfg.bonds.keys())
+            .chain(cfg.vlans.keys())
+            .chain(cfg.tunnels.keys())
+            .chain(cfg.vrfs.keys())
+            .chain(cfg.dummy_devices.keys())
+            .map(|s| s.as_str())
+            .collect();
+
+        for (member_id, membership) in &memberships {
+            if !declared.contains(member_id.as_str()) {
+                files.push(member_stub_file(&out_dir, member_id, membership));
+            }
         }
 
         Ok(files)
@@ -70,30 +125,32 @@ fn write_match_section(out: &mut String, id: &str, common: &CommonDef) {
     out.push('\n');
 }
 
-fn write_network_section(out: &mut String, common: &CommonDef, extra_member_of: Option<&str>) {
+fn write_network_section(out: &mut String, common: &CommonDef, membership: &Membership) {
     out.push_str("[Network]\n");
     if let Some(name) = &common.set_name {
         writeln!(out, "Name={name}").unwrap();
     }
-    if let Some(true) = common.dhcp4 {
-        out.push_str("DHCP=ipv4\n");
+    match (common.dhcp4, common.dhcp6) {
+        (Some(true), Some(true)) => out.push_str("DHCP=yes\n"),
+        (Some(true), _) => out.push_str("DHCP=ipv4\n"),
+        (_, Some(true)) => out.push_str("DHCP=ipv6\n"),
+        _ => {}
     }
-    if let Some(true) = common.dhcp6 {
-        // If dhcp4 already set DHCP, upgrade to yes; otherwise set ipv6
-        if out.contains("DHCP=ipv4") {
-            let replaced = out.replace("DHCP=ipv4\n", "DHCP=yes\n");
-            *out = replaced;
-        } else {
-            out.push_str("DHCP=ipv6\n");
-        }
-    }
-    // link-local
     if let Some(ll) = &common.link_local {
         let val: Vec<&str> = ll.iter().map(|s| s.as_str()).collect();
         writeln!(out, "LinkLocalAddressing={}", val.join(" ")).unwrap();
     }
-    if let Some(bridge) = extra_member_of {
-        writeln!(out, "Bridge={bridge}").unwrap();
+    if let Some(br) = &membership.bridge {
+        writeln!(out, "Bridge={br}").unwrap();
+    }
+    if let Some(bond) = &membership.bond {
+        writeln!(out, "Bond={bond}").unwrap();
+    }
+    if let Some(vrf) = &membership.vrf {
+        writeln!(out, "VRF={vrf}").unwrap();
+    }
+    for vlan in &membership.vlans {
+        writeln!(out, "VLAN={vlan}").unwrap();
     }
     if let Some(ns) = &common.nameservers {
         if !ns.addresses.is_empty() {
@@ -119,7 +176,14 @@ fn write_route_sections(out: &mut String, common: &CommonDef) {
         out.push_str("[Route]\n");
         if let Some(to) = &route.to {
             if to == "default" {
-                out.push_str("Gateway=_dhcp\n");
+                // Default route: Gateway only, no Destination
+                if let Some(via) = &route.via {
+                    writeln!(out, "Gateway={via}").unwrap();
+                } else {
+                    // Can't express a default route without a gateway; skip
+                    out.truncate(out.len() - "[Route]\n".len());
+                    continue;
+                }
             } else {
                 writeln!(out, "Destination={to}").unwrap();
                 if let Some(via) = &route.via {
@@ -132,6 +196,25 @@ fn write_route_sections(out: &mut String, common: &CommonDef) {
         }
         if let Some(table) = route.table {
             writeln!(out, "Table={table}").unwrap();
+        }
+        out.push('\n');
+    }
+}
+
+fn write_routing_policy_sections(out: &mut String, common: &CommonDef) {
+    for rule in &common.routing_policy {
+        out.push_str("[RoutingPolicyRule]\n");
+        if let Some(from) = &rule.from {
+            writeln!(out, "From={from}").unwrap();
+        }
+        if let Some(to) = &rule.to {
+            writeln!(out, "To={to}").unwrap();
+        }
+        if let Some(t) = rule.table {
+            writeln!(out, "Table={t}").unwrap();
+        }
+        if let Some(p) = rule.priority {
+            writeln!(out, "Priority={p}").unwrap();
         }
         out.push('\n');
     }
@@ -186,31 +269,49 @@ fn bool_yn(v: bool) -> &'static str {
     if v { "yes" } else { "no" }
 }
 
-fn common_network_file(dir: &Path, id: &str, common: &CommonDef) -> OutputFile {
+fn common_network_file(dir: &Path, id: &str, common: &CommonDef, membership: &Membership) -> OutputFile {
     let mut out = String::new();
     write_match_section(&mut out, id, common);
-    write_network_section(&mut out, common, None);
+    write_network_section(&mut out, common, membership);
     write_address_sections(&mut out, common);
     write_route_sections(&mut out, common);
+    write_routing_policy_sections(&mut out, common);
     write_dhcp_sections(&mut out, common);
     write_link_section(&mut out, common);
     OutputFile { path: net_path(dir, id), content: out }
 }
 
+/// Minimal .network for a member interface not explicitly declared as any device type.
+fn member_stub_file(dir: &Path, id: &str, membership: &Membership) -> OutputFile {
+    let mut out = String::new();
+    writeln!(out, "[Match]\nName={id}\n").unwrap();
+    out.push_str("[Network]\n");
+    if let Some(br) = &membership.bridge {
+        writeln!(out, "Bridge={br}").unwrap();
+    }
+    if let Some(bond) = &membership.bond {
+        writeln!(out, "Bond={bond}").unwrap();
+    }
+    if let Some(vrf) = &membership.vrf {
+        writeln!(out, "VRF={vrf}").unwrap();
+    }
+    out.push('\n');
+    OutputFile { path: net_path(dir, id), content: out }
+}
+
 // --- per-device-type generators ---
 
-fn ethernet_files(dir: &Path, id: &str, dev: &EthernetDef) -> Vec<OutputFile> {
-    vec![common_network_file(dir, id, &dev.common)]
+fn ethernet_files(dir: &Path, id: &str, dev: &EthernetDef, m: &Membership) -> Vec<OutputFile> {
+    vec![common_network_file(dir, id, &dev.common, m)]
 }
 
-fn wifi_files(dir: &Path, id: &str, dev: &WifiDef) -> Vec<OutputFile> {
-    vec![common_network_file(dir, id, &dev.common)]
+fn wifi_files(dir: &Path, id: &str, dev: &WifiDef, m: &Membership) -> Vec<OutputFile> {
+    vec![common_network_file(dir, id, &dev.common, m)]
 }
 
-fn bridge_files(dir: &Path, id: &str, dev: &BridgeDef) -> Vec<OutputFile> {
+fn bridge_files(dir: &Path, id: &str, dev: &BridgeDef, m: &Membership) -> Vec<OutputFile> {
     let mut files = Vec::new();
 
-    // .netdev for the bridge device itself
     let mut netdev = String::new();
     netdev.push_str("[NetDev]\n");
     writeln!(netdev, "Name={id}").unwrap();
@@ -235,14 +336,12 @@ fn bridge_files(dir: &Path, id: &str, dev: &BridgeDef) -> Vec<OutputFile> {
         }
     }
     files.push(OutputFile { path: netdev_path(dir, id), content: netdev });
-
-    // .network for the bridge interface itself
-    files.push(common_network_file(dir, id, &dev.common));
+    files.push(common_network_file(dir, id, &dev.common, m));
 
     files
 }
 
-fn bond_files(dir: &Path, id: &str, dev: &BondDef) -> Vec<OutputFile> {
+fn bond_files(dir: &Path, id: &str, dev: &BondDef, m: &Membership) -> Vec<OutputFile> {
     let mut files = Vec::new();
 
     let mut netdev = String::new();
@@ -275,12 +374,12 @@ fn bond_files(dir: &Path, id: &str, dev: &BondDef) -> Vec<OutputFile> {
         }
     }
     files.push(OutputFile { path: netdev_path(dir, id), content: netdev });
-    files.push(common_network_file(dir, id, &dev.common));
+    files.push(common_network_file(dir, id, &dev.common, m));
 
     files
 }
 
-fn vlan_files(dir: &Path, id: &str, dev: &VlanDef) -> Vec<OutputFile> {
+fn vlan_files(dir: &Path, id: &str, dev: &VlanDef, m: &Membership) -> Vec<OutputFile> {
     let mut files = Vec::new();
 
     let mut netdev = String::new();
@@ -293,15 +392,12 @@ fn vlan_files(dir: &Path, id: &str, dev: &VlanDef) -> Vec<OutputFile> {
         writeln!(netdev, "Id={vid}").unwrap();
     }
     files.push(OutputFile { path: netdev_path(dir, id), content: netdev });
-
-    // The parent link needs a [Network] section that references this VLAN
-    // We generate the VLAN's own .network file for its IP config
-    files.push(common_network_file(dir, id, &dev.common));
+    files.push(common_network_file(dir, id, &dev.common, m));
 
     files
 }
 
-fn tunnel_files(dir: &Path, id: &str, dev: &TunnelDef) -> Vec<OutputFile> {
+fn tunnel_files(dir: &Path, id: &str, dev: &TunnelDef, m: &Membership) -> Vec<OutputFile> {
     let mut files = Vec::new();
 
     let mut netdev = String::new();
@@ -311,7 +407,8 @@ fn tunnel_files(dir: &Path, id: &str, dev: &TunnelDef) -> Vec<OutputFile> {
         let kind = tunnel_mode_to_kind(mode);
         writeln!(netdev, "Kind={kind}").unwrap();
         netdev.push('\n');
-        writeln!(netdev, "[{kind}]").unwrap(); // section name matches kind for most tunnels
+        let section = tunnel_section_name(kind);
+        writeln!(netdev, "[{section}]").unwrap();
         if let Some(local) = &dev.local {
             writeln!(netdev, "Local={local}").unwrap();
         }
@@ -321,9 +418,32 @@ fn tunnel_files(dir: &Path, id: &str, dev: &TunnelDef) -> Vec<OutputFile> {
         if let Some(ttl) = dev.ttl {
             writeln!(netdev, "TTL={ttl}").unwrap();
         }
+        if kind == "wireguard" {
+            for peer in &dev.peers {
+                netdev.push('\n');
+                netdev.push_str("[WireGuardPeer]\n");
+                if let Some(keys) = &peer.keys {
+                    if let Some(pub_key) = &keys.public {
+                        writeln!(netdev, "PublicKey={pub_key}").unwrap();
+                    }
+                    if let Some(shared) = &keys.shared {
+                        writeln!(netdev, "PresharedKey={shared}").unwrap();
+                    }
+                }
+                if let Some(ips) = &peer.allowed_ips {
+                    writeln!(netdev, "AllowedIPs={}", ips.join(",")).unwrap();
+                }
+                if let Some(ep) = &peer.endpoint {
+                    writeln!(netdev, "Endpoint={ep}").unwrap();
+                }
+                if let Some(ka) = peer.keepalive {
+                    writeln!(netdev, "PersistentKeepalive={ka}").unwrap();
+                }
+            }
+        }
     }
     files.push(OutputFile { path: netdev_path(dir, id), content: netdev });
-    files.push(common_network_file(dir, id, &dev.common));
+    files.push(common_network_file(dir, id, &dev.common, m));
 
     files
 }
@@ -342,7 +462,16 @@ fn tunnel_mode_to_kind(mode: &str) -> &str {
     }
 }
 
-fn vrf_files(dir: &Path, id: &str, dev: &VrfDef) -> Vec<OutputFile> {
+fn tunnel_section_name(kind: &str) -> &str {
+    match kind {
+        "wireguard" => "WireGuard",
+        "vxlan" => "VXLAN",
+        "sit" | "gre" | "ip6gre" | "ipip" | "ipip6" | "ip6ip6" => "Tunnel",
+        other => other,
+    }
+}
+
+fn vrf_files(dir: &Path, id: &str, dev: &VrfDef, m: &Membership) -> Vec<OutputFile> {
     let mut files = Vec::new();
 
     let mut netdev = String::new();
@@ -355,12 +484,12 @@ fn vrf_files(dir: &Path, id: &str, dev: &VrfDef) -> Vec<OutputFile> {
         writeln!(netdev, "Table={table}").unwrap();
     }
     files.push(OutputFile { path: netdev_path(dir, id), content: netdev });
-    files.push(common_network_file(dir, id, &dev.common));
+    files.push(common_network_file(dir, id, &dev.common, m));
 
     files
 }
 
-fn dummy_files(dir: &Path, id: &str, dev: &CommonDef) -> Vec<OutputFile> {
+fn dummy_files(dir: &Path, id: &str, dev: &CommonDef, m: &Membership) -> Vec<OutputFile> {
     let mut files = Vec::new();
 
     let mut netdev = String::new();
@@ -368,7 +497,7 @@ fn dummy_files(dir: &Path, id: &str, dev: &CommonDef) -> Vec<OutputFile> {
     writeln!(netdev, "Name={id}").unwrap();
     netdev.push_str("Kind=dummy\n");
     files.push(OutputFile { path: netdev_path(dir, id), content: netdev });
-    files.push(common_network_file(dir, id, dev));
+    files.push(common_network_file(dir, id, dev, m));
 
     files
 }
@@ -388,14 +517,19 @@ mod tests {
         (tmp, cfg)
     }
 
+    fn file_content<'a>(files: &'a [OutputFile], suffix: &str) -> Option<&'a str> {
+        files.iter()
+            .find(|f| f.path.to_string_lossy().ends_with(suffix))
+            .map(|f| f.content.as_str())
+    }
+
     #[test]
     fn test_ethernet_dhcp4_generates_network_file() {
         let (_tmp, cfg) = setup_config(
             "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: true\n",
         );
         let out_tmp = TempDir::new().unwrap();
-        let backend = Networkd;
-        let files = backend.generate(&cfg, out_tmp.path()).unwrap();
+        let files = Networkd.generate(&cfg, out_tmp.path()).unwrap();
         assert_eq!(files.len(), 1);
         let f = &files[0];
         assert!(f.path.ends_with("10-netplan-eth0.network"));
@@ -415,18 +549,58 @@ mod tests {
     }
 
     #[test]
-    fn test_bridge_generates_netdev_and_network() {
+    fn test_bridge_generates_netdev_network_and_member_stub() {
         let (_tmp, cfg) = setup_config(
             "network:\n  version: 2\n  bridges:\n    br0:\n      interfaces: [eth0]\n      dhcp4: true\n",
         );
         let out_tmp = TempDir::new().unwrap();
         let files = Networkd.generate(&cfg, out_tmp.path()).unwrap();
-        assert_eq!(files.len(), 2);
-        let names: Vec<_> = files.iter().map(|f| f.path.file_name().unwrap().to_str().unwrap()).collect();
+        // br0.netdev, br0.network, eth0.network (stub)
+        assert_eq!(files.len(), 3);
+        let names: Vec<_> = files.iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+            .collect();
         assert!(names.contains(&"10-netplan-br0.netdev"));
         assert!(names.contains(&"10-netplan-br0.network"));
-        let netdev = files.iter().find(|f| f.path.extension().unwrap() == "netdev").unwrap();
-        assert!(netdev.content.contains("Kind=bridge"));
+        assert!(names.contains(&"10-netplan-eth0.network"));
+        let eth0 = file_content(&files, "eth0.network").unwrap();
+        assert!(eth0.contains("Bridge=br0"));
+    }
+
+    #[test]
+    fn test_bridge_member_declared_in_ethernets_gets_bridge_entry() {
+        let (_tmp, cfg) = setup_config(
+            "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: false\n  bridges:\n    br0:\n      interfaces: [eth0]\n      dhcp4: true\n",
+        );
+        let out_tmp = TempDir::new().unwrap();
+        let files = Networkd.generate(&cfg, out_tmp.path()).unwrap();
+        // eth0 is declared → no extra stub, but eth0.network must contain Bridge=br0
+        let eth0 = file_content(&files, "eth0.network").unwrap();
+        assert!(eth0.contains("Bridge=br0"), "eth0.network missing Bridge=br0:\n{eth0}");
+    }
+
+    #[test]
+    fn test_bond_member_gets_bond_entry() {
+        let (_tmp, cfg) = setup_config(
+            "network:\n  version: 2\n  bonds:\n    bond0:\n      interfaces: [eth0, eth1]\n      parameters:\n        mode: active-backup\n",
+        );
+        let out_tmp = TempDir::new().unwrap();
+        let files = Networkd.generate(&cfg, out_tmp.path()).unwrap();
+        let eth0 = file_content(&files, "eth0.network").unwrap();
+        let eth1 = file_content(&files, "eth1.network").unwrap();
+        assert!(eth0.contains("Bond=bond0"));
+        assert!(eth1.contains("Bond=bond0"));
+    }
+
+    #[test]
+    fn test_vlan_parent_gets_vlan_ref() {
+        let (_tmp, cfg) = setup_config(
+            "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: false\n  vlans:\n    vlan10:\n      id: 10\n      link: eth0\n",
+        );
+        let out_tmp = TempDir::new().unwrap();
+        let files = Networkd.generate(&cfg, out_tmp.path()).unwrap();
+        let eth0 = file_content(&files, "eth0.network").unwrap();
+        assert!(eth0.contains("VLAN=vlan10"), "eth0.network missing VLAN=vlan10:\n{eth0}");
     }
 
     #[test]
@@ -451,5 +625,42 @@ mod tests {
         let content = &files[0].content;
         assert!(content.contains("DNS=8.8.8.8 8.8.4.4"));
         assert!(content.contains("Domains=example.com"));
+    }
+
+    #[test]
+    fn test_default_route_uses_gateway() {
+        let (_tmp, cfg) = setup_config(
+            "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: false\n      routes:\n        - to: default\n          via: 192.168.1.1\n",
+        );
+        let out_tmp = TempDir::new().unwrap();
+        let files = Networkd.generate(&cfg, out_tmp.path()).unwrap();
+        let content = &files[0].content;
+        assert!(content.contains("Gateway=192.168.1.1"), "content:\n{content}");
+        assert!(!content.contains("Gateway=_dhcp"), "content:\n{content}");
+        assert!(!content.contains("Destination=default"), "content:\n{content}");
+    }
+
+    #[test]
+    fn test_routing_policy_rule() {
+        let (_tmp, cfg) = setup_config(
+            "network:\n  version: 2\n  ethernets:\n    eth0:\n      routing-policy:\n        - from: 10.0.0.0/8\n          table: 100\n          priority: 10\n",
+        );
+        let out_tmp = TempDir::new().unwrap();
+        let files = Networkd.generate(&cfg, out_tmp.path()).unwrap();
+        let content = &files[0].content;
+        assert!(content.contains("[RoutingPolicyRule]"), "content:\n{content}");
+        assert!(content.contains("From=10.0.0.0/8"));
+        assert!(content.contains("Table=100"));
+        assert!(content.contains("Priority=10"));
+    }
+
+    #[test]
+    fn test_dual_stack_dhcp() {
+        let (_tmp, cfg) = setup_config(
+            "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: true\n      dhcp6: true\n",
+        );
+        let out_tmp = TempDir::new().unwrap();
+        let files = Networkd.generate(&cfg, out_tmp.path()).unwrap();
+        assert!(files[0].content.contains("DHCP=yes"));
     }
 }
